@@ -7,6 +7,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"time"
+)
+
+const (
+	watchCancelDialContextTimeout = time.Second * 10
 )
 
 // Implement the "QueryerContext" interface
@@ -82,20 +87,51 @@ func (cn *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, 
 	return tx, nil
 }
 
+func (cn *conn) Ping(ctx context.Context) error {
+	if finish := cn.watchCancel(ctx); finish != nil {
+		defer finish()
+	}
+	rows, err := cn.simpleQuery(";")
+	if err != nil {
+		return driver.ErrBadConn // https://golang.org/pkg/database/sql/driver/#Pinger
+	}
+	rows.Close()
+	return nil
+}
+
 func (cn *conn) watchCancel(ctx context.Context) func() {
 	if done := ctx.Done(); done != nil {
-		finished := make(chan struct{})
+		finished := make(chan struct{}, 1)
 		go func() {
 			select {
 			case <-done:
-				_ = cn.cancel()
-				finished <- struct{}{}
+				select {
+				case finished <- struct{}{}:
+				default:
+					// We raced with the finish func, let the next query handle this with the
+					// context.
+					return
+				}
+
+				// Set the connection state to bad so it does not get reused.
+				cn.err.set(ctx.Err())
+
+				// At this point the function level context is canceled,
+				// so it must not be used for the additional network
+				// request to cancel the query.
+				// Create a new context to pass into the dial.
+				ctxCancel, cancel := context.WithTimeout(context.Background(), watchCancelDialContextTimeout)
+				defer cancel()
+
+				_ = cn.cancel(ctxCancel)
 			case <-finished:
 			}
 		}()
 		return func() {
 			select {
 			case <-finished:
+				cn.err.set(ctx.Err())
+				cn.Close()
 			case finished <- struct{}{}:
 			}
 		}
@@ -103,8 +139,17 @@ func (cn *conn) watchCancel(ctx context.Context) func() {
 	return nil
 }
 
-func (cn *conn) cancel() error {
-	c, err := dial(cn.dialer, cn.opts)
+func (cn *conn) cancel(ctx context.Context) error {
+	// Create a new values map (copy). This makes sure the connection created
+	// in this method cannot write to the same underlying data, which could
+	// cause a concurrent map write panic. This is necessary because cancel
+	// is called from a goroutine in watchCancel.
+	o := make(values)
+	for k, v := range cn.opts {
+		o[k] = v
+	}
+
+	c, err := dial(ctx, cn.dialer, o)
 	if err != nil {
 		return err
 	}
@@ -114,7 +159,7 @@ func (cn *conn) cancel() error {
 		can := conn{
 			c: c,
 		}
-		err = can.ssl(cn.opts)
+		err = can.ssl(o)
 		if err != nil {
 			return err
 		}
@@ -168,13 +213,21 @@ func (st *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driv
 	return st.Exec(list)
 }
 
+// watchCancel is implemented on stmt in order to not mark the parent conn as bad
 func (st *stmt) watchCancel(ctx context.Context) func() {
 	if done := ctx.Done(); done != nil {
 		finished := make(chan struct{})
 		go func() {
 			select {
 			case <-done:
-				_ = st.cancel()
+				// At this point the function level context is canceled,
+				// so it must not be used for the additional network
+				// request to cancel the query.
+				// Create a new context to pass into the dial.
+				ctxCancel, cancel := context.WithTimeout(context.Background(), watchCancelDialContextTimeout)
+				defer cancel()
+
+				_ = st.cancel(ctxCancel)
 				finished <- struct{}{}
 			case <-finished:
 			}
@@ -189,6 +242,6 @@ func (st *stmt) watchCancel(ctx context.Context) func() {
 	return nil
 }
 
-func (st *stmt) cancel() error {
-	return st.cn.cancel()
+func (st *stmt) cancel(ctx context.Context) error {
+	return st.cn.cancel(ctx)
 }
