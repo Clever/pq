@@ -1,6 +1,6 @@
 module github.com/lib/pq/auth/kerberos
 
-go 1.13
+go 1.24
 
 require (
 	github.com/alexbrainman/sspi v0.0.0-20180613141037-e580b900e9f5
